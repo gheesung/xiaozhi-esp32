@@ -22,6 +22,8 @@ public:
     virtual ~LvglDisplay();
 
     virtual void SetStatus(const char* status);
+    // Extra text shown after the idle clock in the status bar (e.g. room climate).
+    virtual std::string GetStatusExtraText() { return ""; }
     virtual void ShowNotification(const char* notification, int duration_ms = 3000);
     virtual void ShowNotification(const std::string& notification, int duration_ms = 3000);
     virtual void SetPreviewImage(std::unique_ptr<LvglImage> image) override;

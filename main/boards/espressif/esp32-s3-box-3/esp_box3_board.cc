@@ -7,6 +7,8 @@
 #include "application.h"
 #include "button.h"
 #include "config.h"
+#include "idle_face.h"
+#include "sensor_dock.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -14,6 +16,182 @@
 #include <driver/spi_common.h>
 
 #define TAG "EspBox3Board"
+
+// Status bar: append the sensor dock's room climate next to the clock, refreshed
+// at most every 10 minutes (the bar itself repaints once a second).
+class Box3LcdDisplay : public SpiLcdDisplay {
+public:
+    using SpiLcdDisplay::SpiLcdDisplay;
+
+    // Draw our own battery: outline + level fill + the percentage centred on top.
+    // The stock material-symbol glyph is only 14 px, too small to overlay a number.
+    void UpdateStatusBar(bool update_all = false) override {
+        SpiLcdDisplay::UpdateStatusBar(update_all);
+        UpdateDockBattery();
+        UpdateIdleFace();
+    }
+
+    // Create the idle clock face once the stock UI exists; it is drawn on top of
+    // the emoji box so no LVGL surgery in lcd_display.cc is needed.
+    void SetupUI() override {
+        SpiLcdDisplay::SetupUI();
+        if (idle_face_.IsInitialized()) {
+            return;
+        }
+        DisplayLockGuard lock(this);
+        lv_obj_t* screen = lv_screen_active();
+        lv_obj_update_layout(screen);
+        const int32_t top = top_bar_ != nullptr ? lv_obj_get_height(top_bar_) : 0;
+        const lv_color_t fg = status_label_ != nullptr
+                                  ? lv_obj_get_style_text_color(status_label_, LV_PART_MAIN)
+                                  : lv_color_black();
+        const lv_color_t bg = lv_obj_get_style_bg_color(screen, LV_PART_MAIN);
+        idle_face_.Init(screen, LV_HOR_RES, LV_VER_RES, top, fg, bg);
+        // Keep the low-battery warning above the face.
+        if (low_battery_popup_ != nullptr) {
+            lv_obj_move_foreground(low_battery_popup_);
+        }
+    }
+
+    std::string GetStatusExtraText() override {
+        constexpr int64_t kEnvRefreshUs = 10LL * 60 * 1000 * 1000;
+        static int64_t last_read_us = 0;
+        static std::string cached;
+        const int64_t now = esp_timer_get_time();
+        if (cached.empty() || now - last_read_us > kEnvRefreshUs) {
+            float temperature = 0.0f;
+            float humidity = 0.0f;
+            if (SensorDock::GetInstance().ReadTemperatureHumidity(temperature, humidity)) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%.0fC %.0f%%", temperature, humidity);
+                cached = buf;
+            }
+            last_read_us = now;
+        }
+        return cached;
+    }
+
+private:
+    IdleFace idle_face_;
+    lv_obj_t* batt_box_ = nullptr;
+    lv_obj_t* batt_fill_ = nullptr;
+    lv_obj_t* batt_nub_ = nullptr;
+    lv_obj_t* batt_text_ = nullptr;
+
+    // Show the clock face while the device idles and keep it ticking. The small
+    // status-bar clock is blanked so the time is not on screen twice.
+    void UpdateIdleFace() {
+        if (!idle_face_.IsInitialized()) {
+            return;
+        }
+        const bool idle = Application::GetInstance().GetDeviceState() == kDeviceStateIdle;
+        const bool previewing =
+            preview_image_ != nullptr && !lv_obj_has_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        const bool show = idle && !previewing;
+
+        if (!Lock(100)) {
+            return;
+        }
+        idle_face_.SetVisible(show);
+        if (show) {
+            if (status_label_ != nullptr && lv_label_get_text(status_label_)[0] != '\0') {
+                lv_label_set_text(status_label_, "");
+            }
+            idle_face_.Refresh();
+        }
+        Unlock();
+
+        if (show) {
+            idle_face_.StartWeatherFetch();
+        }
+    }
+
+    void UpdateDockBattery() {
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        const bool have = Board::GetInstance().GetBatteryLevel(level, charging, discharging);
+
+        if (!Lock(0)) {
+            return;
+        }
+
+        // The built-in glyph stays empty: our widget replaces it in the same slot.
+        if (battery_label_ != nullptr) {
+            lv_label_set_text(battery_label_, "");
+        }
+
+        if (!have) {
+            if (batt_box_ != nullptr) {
+                lv_obj_add_flag(batt_box_, LV_OBJ_FLAG_HIDDEN);
+            }
+            Unlock();
+            return;
+        }
+
+        // Inherit the bar's text colour/font instead of reaching into the theme type.
+        const lv_color_t fg = battery_label_ != nullptr
+                                  ? lv_obj_get_style_text_color(battery_label_, LV_PART_MAIN)
+                                  : lv_color_black();
+        const lv_color_t fill_color =
+            level <= 20 ? lv_color_hex(0xD32F2F) : (level <= 50 ? lv_color_hex(0xF9A825) : fg);
+
+        if (batt_box_ == nullptr) {
+            lv_obj_t* parent = battery_label_ != nullptr ? lv_obj_get_parent(battery_label_) : nullptr;
+            if (parent == nullptr) {
+                Unlock();
+                return;
+            }
+
+            batt_box_ = lv_obj_create(parent);
+            lv_obj_set_size(batt_box_, 44, 18);
+            lv_obj_set_style_radius(batt_box_, 3, 0);
+            lv_obj_set_style_border_width(batt_box_, 1, 0);
+            lv_obj_set_style_border_color(batt_box_, fg, 0);
+            lv_obj_set_style_bg_opa(batt_box_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_pad_all(batt_box_, 0, 0);
+            lv_obj_set_style_margin_left(batt_box_, 4, 0);
+            lv_obj_clear_flag(batt_box_, LV_OBJ_FLAG_SCROLLABLE);
+
+            batt_fill_ = lv_obj_create(batt_box_);
+            lv_obj_set_size(batt_fill_, 0, 12);
+            lv_obj_align(batt_fill_, LV_ALIGN_LEFT_MID, 2, 0);
+            lv_obj_set_style_radius(batt_fill_, 1, 0);
+            lv_obj_set_style_border_width(batt_fill_, 0, 0);
+            lv_obj_set_style_pad_all(batt_fill_, 0, 0);
+            lv_obj_set_style_bg_opa(batt_fill_, LV_OPA_50, 0);
+            lv_obj_set_style_bg_color(batt_fill_, fill_color, 0);
+
+            batt_nub_ = lv_obj_create(batt_box_);
+            lv_obj_set_size(batt_nub_, 2, 8);
+            lv_obj_align(batt_nub_, LV_ALIGN_RIGHT_MID, 3, 0);
+            lv_obj_set_style_radius(batt_nub_, 1, 0);
+            lv_obj_set_style_border_width(batt_nub_, 0, 0);
+            lv_obj_set_style_pad_all(batt_nub_, 0, 0);
+            lv_obj_set_style_bg_color(batt_nub_, fg, 0);
+            lv_obj_set_style_bg_opa(batt_nub_, LV_OPA_COVER, 0);
+
+            batt_text_ = lv_label_create(batt_box_);
+            lv_obj_set_style_text_font(batt_text_, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(batt_text_, fg, 0);
+            lv_obj_center(batt_text_);
+        }
+
+        lv_obj_clear_flag(batt_box_, LV_OBJ_FLAG_HIDDEN);
+        char text[8];
+        snprintf(text, sizeof(text), "%d%%", level);
+        lv_label_set_text(batt_text_, text);
+
+        int width = static_cast<int>(38.0f * (level / 100.0f));
+        if (width < 1 && level > 0) {
+            width = 1;
+        }
+        lv_obj_set_width(batt_fill_, width);
+        lv_obj_set_style_bg_color(batt_fill_, fill_color, 0);
+
+        Unlock();
+    }
+};
 
 // Init ili9341 by custom cmd
 static const ili9341_lcd_init_cmd_t vendor_specific_init[] = {
@@ -69,6 +247,7 @@ private:
         buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
+
 
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
@@ -131,7 +310,7 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        display_ = new Box3LcdDisplay(panel_io, panel,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
 #endif
     }
@@ -143,6 +322,16 @@ public:
         InitializeIli9341Display();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
+
+        // ESP32-S3-BOX-3-SENSOR dock (optional): AHT21 temp/humidity, radar, IR, 18650.
+        // Everything degrades gracefully when the dock is not attached.
+        auto& sensor_dock = SensorDock::GetInstance();
+        const bool dock_ok = sensor_dock.Init();
+        if (dock_ok) {
+            ESP_LOGI(TAG, "ESP32-S3-BOX-3-SENSOR dock detected");
+        }
+        sensor_dock.RegisterTools();
+        RegisterIdleFaceTools();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -164,6 +353,29 @@ public:
 
     virtual Display* GetDisplay() override {
         return display_;
+    }
+
+    // Top-right battery indicator: the dock's 18650, sampled every 2 minutes.
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        constexpr int64_t kBatteryRefreshUs = 2LL * 60 * 1000 * 1000;
+        static int64_t last_read_us = 0;
+        static int cached_level = -1;
+        static bool have_value = false;
+        const int64_t now = esp_timer_get_time();
+        if (!have_value || now - last_read_us > kBatteryRefreshUs) {
+            float voltage = 0.0f;
+            int percent = 0;
+            have_value = SensorDock::GetInstance().ReadBattery(voltage, percent);
+            cached_level = percent;
+            last_read_us = now;
+        }
+        if (!have_value) {
+            return false;  // no dock -> no icon (boards without a battery behave the same)
+        }
+        level = cached_level;
+        charging = false;     // the dock exposes no charge-status pin we read
+        discharging = true;
+        return true;
     }
 
     virtual Backlight* GetBacklight() override {

@@ -22,6 +22,8 @@
 
 #define BUILTIN_LED_GPIO        GPIO_NUM_NC
 #define BOOT_BUTTON_GPIO        GPIO_NUM_0
+// The red round button on the top edge (silkscreened MUTE), active low.
+#define RED_BUTTON_GPIO         GPIO_NUM_1
 #define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_NC
 #define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
 
